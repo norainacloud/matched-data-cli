@@ -57,3 +57,47 @@ uBS5eBttHrqkdY41kbZPdvYnNz8Vj0TvKIUpjB1y/GA=
 $ printf 'AzTY6FHajXYXuDMUte82wrd+1n5CEHPoydYiyd3FMg5IEQAAAAAAAAA0lOhGXBclw8pWU5jbbYuepSIJN5JohTtZekLliJBlVWk=' | matched-data-cli decrypt -k private_key.txt -
 test matched data
 ```
+
+To decrypt a list of firewall events, as exported from the Cloudflare dashboard, use the
+`firewall-events-json` input format. Each event that has an `encrypted_matched_data` metadata
+entry gets it replaced, in place, by a `matched_data` entry holding the decrypted payload; events
+without one are passed through untouched:
+
+``` shell
+$ cat firewall-events.json
+[
+  {
+    "ruleId": "6179ae15870a4bb7b2d480d4843b323c",
+    "metadata": [
+      {
+        "key": "ruleset_version",
+        "value": "87"
+      },
+      {
+        "key": "encrypted_matched_data",
+        "value": "AzTY6FHajXYXuDMUte82wrd+1n5CEHPoydYiyd3FMg5IEQAAAAAAAAA0lOhGXBclw8pWU5jbbYuepSIJN5JohTtZekLliJBlVWk="
+      }
+    ]
+  }
+]
+$ matched-data-cli decrypt -k private_key.txt -i firewall-events-json firewall-events.json
+[
+  {
+    "ruleId": "6179ae15870a4bb7b2d480d4843b323c",
+    "metadata": [
+      {
+        "key": "ruleset_version",
+        "value": "87"
+      },
+      {
+        "key": "matched_data",
+        "value": "test matched data"
+      }
+    ]
+  }
+]
+```
+
+Events whose payload cannot be decrypted (for example, a payload that was truncated because it was
+too large) are left as they are and reported on stderr, so a single failing event does not discard
+the rest of the output.

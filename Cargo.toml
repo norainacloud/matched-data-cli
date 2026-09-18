@@ -15,7 +15,7 @@ hpke = { version = "0.8.0", default-features = false, features = [
 radix64 = "0.6.2"
 rand = "0.8.4"
 serde = { version = "1.0.130", features = ["derive"] }
-serde_json = "1.0.68"
+serde_json = { version = "1.0.68", features = ["preserve_order"] }
 
 [dev-dependencies]
 assert_cmd = "2.0.2"
