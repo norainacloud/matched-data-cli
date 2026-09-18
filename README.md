@@ -58,10 +58,16 @@ $ printf 'AzTY6FHajXYXuDMUte82wrd+1n5CEHPoydYiyd3FMg5IEQAAAAAAAAA0lOhGXBclw8pWU5
 test matched data
 ```
 
-To decrypt a list of firewall events, as exported from the Cloudflare dashboard, use the
-`firewall-events-json` input format. Each event that has an `encrypted_matched_data` metadata
-entry gets it replaced, in place, by a `matched_data` entry holding the decrypted payload; events
-without one are passed through untouched:
+To decrypt firewall events, as exported from the Cloudflare dashboard, use the
+`firewall-events-json` input format for a JSON list (or a single event), or
+`firewall-events-jsonl` for JSON Lines, one event per line. Each encrypted payload found in an
+event is replaced, in place, by the decrypted one under `matched_data`; events without a payload
+are passed through untouched. Both metadata shapes are recognised:
+
+``` plain
+{ "key": "encrypted_matched_data", "value": "<payload>" }   ->  { "key": "matched_data", "value": "<decrypted>" }
+{ "encrypted_matched_data": "<payload>" }                   ->  { "matched_data": "<decrypted>" }
+```
 
 ``` shell
 $ cat firewall-events.json
@@ -96,6 +102,13 @@ $ matched-data-cli decrypt -k private_key.txt -i firewall-events-json firewall-e
     ]
   }
 ]
+```
+
+JSON Lines input is written back one event per line:
+
+``` shell
+$ matched-data-cli decrypt -k private_key.txt -i firewall-events-jsonl firewall-events.jsonl
+{"ruleId":"6179ae15870a4bb7b2d480d4843b323c","metadata":[{"key":"matched_data","value":"test matched data"}]}
 ```
 
 Events whose payload cannot be decrypted (for example, a payload that was truncated because it was

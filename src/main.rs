@@ -47,6 +47,8 @@ enum DecryptInputFormat {
     Blob,
     /// A JSON list of firewall events, as exported from the Cloudflare dashboard
     FirewallEventsJson,
+    /// Firewall events as JSON Lines, one event per line
+    FirewallEventsJsonl,
 }
 
 #[derive(Parser)]
@@ -98,7 +100,6 @@ struct KeyPair {
 }
 
 const TRUNCATED: &str = "truncated";
-const METADATA_KEY: &str = "metadata";
 const ENCRYPTED_MATCHED_DATA_KEY: &str = "encrypted_matched_data";
 const MATCHED_DATA_KEY: &str = "matched_data";
 
@@ -153,32 +154,76 @@ fn decrypt_matched_data(
     Ok(matched_data)
 }
 
-// Decrypts the `encrypted_matched_data` metadata entry of a firewall event, if present,
-// replacing it with a `matched_data` entry holding the decrypted payload.
-// Events without that entry are left untouched, and failures are reported on stderr so
-// that a single bad event does not discard the rest of the output.
+// Decrypts every encrypted matched data payload found in a firewall event, in place.
+//
+// Both metadata shapes are recognised, wherever they appear in the event:
+//   `{"key": "encrypted_matched_data", "value": "<payload>"}`
+//   `{"encrypted_matched_data": "<payload>"}`
+// Each is rewritten to hold the decrypted payload under `matched_data`, keeping the
+// surrounding fields and their order. Events without a payload are left untouched, and
+// failures are reported on stderr so that a single bad event does not discard the rest
+// of the output.
 fn decrypt_event_matched_data(event: &mut Value, private_key_bytes: &[u8]) {
-    let metadata = match event.get_mut(METADATA_KEY).and_then(Value::as_array_mut) {
-        Some(metadata) => metadata,
-        None => return,
-    };
-
-    for entry in metadata.iter_mut() {
-        if entry.get("key").and_then(Value::as_str) != Some(ENCRYPTED_MATCHED_DATA_KEY) {
-            continue;
-        }
-
-        let matched_data_base64 = match entry.get("value").and_then(Value::as_str) {
-            Some(value) => value.trim_end().to_string(),
-            None => continue,
-        };
-
-        match decrypt_matched_data(&matched_data_base64, private_key_bytes) {
-            Ok(matched_data) => {
-                entry["key"] = Value::from(MATCHED_DATA_KEY);
-                entry["value"] = Value::from(String::from_utf8_lossy(&matched_data).into_owned());
+    match event {
+        Value::Array(events) => {
+            for event in events.iter_mut() {
+                decrypt_event_matched_data(event, private_key_bytes);
             }
-            Err(error) => eprintln!("Failed to decrypt matched data of event: {}", error),
+        }
+        Value::Object(entry) => {
+            // `{"key": "encrypted_matched_data", "value": "<payload>"}`
+            if entry.get("key").and_then(Value::as_str) == Some(ENCRYPTED_MATCHED_DATA_KEY) {
+                if let Some(matched_data) = entry
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .and_then(|payload| decrypt_event_payload(payload, private_key_bytes))
+                {
+                    entry["key"] = Value::from(MATCHED_DATA_KEY);
+                    entry["value"] = matched_data;
+                }
+
+                return;
+            }
+
+            // `{"encrypted_matched_data": "<payload>"}`
+            if let Some(matched_data) = entry
+                .get(ENCRYPTED_MATCHED_DATA_KEY)
+                .and_then(Value::as_str)
+                .and_then(|payload| decrypt_event_payload(payload, private_key_bytes))
+            {
+                // Rebuild the entry rather than removing and inserting, to keep field order
+                let mut matched_data = Some(matched_data);
+                *entry = std::mem::take(entry)
+                    .into_iter()
+                    .map(|(key, value)| {
+                        if key == ENCRYPTED_MATCHED_DATA_KEY {
+                            if let Some(matched_data) = matched_data.take() {
+                                return (MATCHED_DATA_KEY.to_string(), matched_data);
+                            }
+                        }
+
+                        (key, value)
+                    })
+                    .collect();
+            }
+
+            for (_, value) in entry.iter_mut() {
+                decrypt_event_matched_data(value, private_key_bytes);
+            }
+        }
+        _ => {}
+    }
+}
+
+// Decrypts a single payload of an event, reporting failures on stderr
+fn decrypt_event_payload(payload: &str, private_key_bytes: &[u8]) -> Option<Value> {
+    match decrypt_matched_data(payload.trim_end(), private_key_bytes) {
+        Ok(matched_data) => Some(Value::from(
+            String::from_utf8_lossy(&matched_data).into_owned(),
+        )),
+        Err(error) => {
+            eprintln!("Failed to decrypt matched data of event: {}", error);
+            None
         }
     }
 }
@@ -244,28 +289,44 @@ fn run(options: Options) -> Result<(), String> {
                     let mut events: Value = serde_json::from_str(&input)
                         .map_err(|_| "Provided firewall events are not valid JSON")?;
 
-                    match events {
-                        Value::Array(ref mut events) => {
-                            for event in events.iter_mut() {
-                                decrypt_event_matched_data(event, &private_key_bytes);
-                            }
-                        }
-                        Value::Object(_) => {
-                            decrypt_event_matched_data(&mut events, &private_key_bytes)
-                        }
-                        _ => {
-                            return Err(
-                                "Expected a list of firewall events or a single firewall event"
-                                    .to_string(),
-                            )
-                        }
+                    if !events.is_array() && !events.is_object() {
+                        return Err(
+                            "Expected a list of firewall events or a single firewall event"
+                                .to_string(),
+                        );
                     }
+
+                    decrypt_event_matched_data(&mut events, &private_key_bytes);
 
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&events)
                             .map_err(|_| "Failed to output firewall events")?
                     );
+                }
+                DecryptInputFormat::FirewallEventsJsonl => {
+                    let mut out = stdout();
+
+                    for (number, line) in input.lines().enumerate() {
+                        // Blank lines carry no event, keep going
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+
+                        let mut event: Value = serde_json::from_str(line).map_err(|_| {
+                            format!("Line {} is not a valid JSON firewall event", number + 1)
+                        })?;
+
+                        decrypt_event_matched_data(&mut event, &private_key_bytes);
+
+                        writeln!(
+                            out,
+                            "{}",
+                            serde_json::to_string(&event)
+                                .map_err(|_| "Failed to output firewall events")?
+                        )
+                        .map_err(|_| "Failed to output firewall events")?;
+                    }
                 }
             }
         }
@@ -386,11 +447,19 @@ mod tests {
 
         let events = serde_json::json!([
             {
-                "ruleId": "with-matched-data",
+                "ruleId": "key-value-metadata",
                 "metadata": [
                     { "key": "ruleset_version", "value": "87" },
                     { "key": "encrypted_matched_data", "value": encrypted_matched_data },
                 ],
+            },
+            {
+                "ruleId": "object-metadata",
+                "metadata": {
+                    "ruleset_version": "87",
+                    "encrypted_matched_data": encrypted_matched_data,
+                    "score_total": "40",
+                },
             },
             {
                 "ruleId": "without-matched-data",
@@ -433,12 +502,23 @@ mod tests {
             ])
         );
 
+        // The same goes for metadata held as an object, whose field order is kept
+        assert_eq!(
+            serde_json::to_string(&decrypted[1]["metadata"]).unwrap(),
+            serde_json::to_string(&serde_json::json!({
+                "ruleset_version": "87",
+                "matched_data": matched_data,
+                "score_total": "40",
+            }))
+            .unwrap()
+        );
+
         // Events without matched data are passed through untouched
-        assert_eq!(decrypted[1], events[1]);
-        assert_eq!(decrypted[3], events[3]);
+        assert_eq!(decrypted[2], events[2]);
+        assert_eq!(decrypted[4], events[4]);
 
         // Truncated matched data is kept as is and reported on stderr
-        assert_eq!(decrypted[2], events[2]);
+        assert_eq!(decrypted[3], events[3]);
         assert!(str::from_utf8(&out.stderr)
             .unwrap()
             .contains("it was too large"));
@@ -462,6 +542,92 @@ mod tests {
             decrypted,
             serde_json::from_slice::<Value>(&out.stdout).unwrap()
         );
+
+        temp_dir.close().unwrap();
+    }
+
+    #[test]
+    fn test_decrypt_firewall_events_jsonl() {
+        let matched_data = "test matched data";
+        // Encrypted with public key:
+        // Ycig/Zr/pZmklmFUN99nr+taURlYItL91g+NcHGYpB8=
+        let encrypted_matched_data = "AzTY6FHajXYXuDMUte82wrd+1n5CEHPoydYiyd3FMg5IEQAAAAAAAAA0lOhGXBclw8pWU5jbbYuepSIJN5JohTtZekLliJBlVWk=";
+        let private_key = "uBS5eBttHrqkdY41kbZPdvYnNz8Vj0TvKIUpjB1y/GA=";
+
+        let events = [
+            serde_json::json!({
+                "ruleId": "key-value-metadata",
+                "metadata": [{ "key": "encrypted_matched_data", "value": encrypted_matched_data }],
+            }),
+            serde_json::json!({
+                "ruleId": "object-metadata",
+                "metadata": { "encrypted_matched_data": encrypted_matched_data },
+            }),
+            serde_json::json!({ "ruleId": "without-matched-data" }),
+        ];
+
+        // Blank lines are skipped
+        let input = format!("{}\n\n{}\n{}\n", events[0], events[1], events[2]);
+
+        let temp_dir = assert_fs::TempDir::new().unwrap();
+        let events_file = temp_dir.child("events.jsonl");
+        events_file.write_str(&input).unwrap();
+        let private_key_file = temp_dir.child("private_key.txt");
+        private_key_file.write_str(private_key).unwrap();
+
+        let mut cmd = Command::cargo_bin("matched-data-cli").unwrap();
+        let out = cmd
+            .args(&[
+                "decrypt",
+                "-k",
+                private_key_file.path().to_str().unwrap(),
+                "-i",
+                "firewall-events-jsonl",
+                events_file.path().to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+
+        // One event per line, in the order they came in
+        let decrypted: Vec<Value> = str::from_utf8(&out.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        assert_eq!(
+            decrypted,
+            vec![
+                serde_json::json!({
+                    "ruleId": "key-value-metadata",
+                    "metadata": [{ "key": "matched_data", "value": matched_data }],
+                }),
+                serde_json::json!({
+                    "ruleId": "object-metadata",
+                    "metadata": { "matched_data": matched_data },
+                }),
+                events[2].clone(),
+            ]
+        );
+
+        // A line that is not valid JSON is reported, pointing at the line
+        cmd = Command::cargo_bin("matched-data-cli").unwrap();
+        let out = cmd
+            .args(&[
+                "decrypt",
+                "-k",
+                private_key_file.path().to_str().unwrap(),
+                "-i",
+                "firewall-events-jsonl",
+                "-",
+            ])
+            .write_stdin(format!("{}\nnot json\n", events[0]))
+            .output()
+            .unwrap();
+
+        assert!(str::from_utf8(&out.stderr)
+            .unwrap()
+            .contains("Line 2 is not a valid JSON firewall event"));
 
         temp_dir.close().unwrap();
     }
